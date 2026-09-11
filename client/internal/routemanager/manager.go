@@ -50,6 +50,7 @@ type Manager interface {
 	Init() error
 	UpdateRoutes(updateSerial uint64, serverRoutes map[route.ID]*route.Route, clientRoutes route.HAMap, useNewDNSRoute bool) error
 	ClassifyRoutes(newRoutes []*route.Route) (map[route.ID]*route.Route, route.HAMap)
+	PrepareRouteRanges(newRoutes []*route.Route) []string
 	TriggerSelection(route.HAMap)
 	SelectRoutes(ids []route.NetID, appendRoute bool) error
 	DeselectRoutes(ids []route.NetID) error
@@ -159,7 +160,7 @@ func (m *DefaultManager) setupRefCounters(useNoop bool) {
 	var wgIface *net.Interface
 	toInterface := func() *net.Interface {
 		once.Do(func() {
-			wgIface = m.wgInterface.ToInterface()
+			wgIface = routeSystemInterface(m.wgInterface)
 		})
 		return wgIface
 	}
@@ -722,6 +723,42 @@ func resolveURLsToIPs(urls []string) []net.IP {
 		ips = append(ips, ipAddrs...)
 	}
 	return ips
+}
+
+// PrepareRouteRanges projects a management route set into the static prefixes
+// that a mobile VPN must include at creation time. It updates only the route
+// selector and cached client-route model; route handlers and system routes are
+// deliberately left untouched until UpdateRoutes replays the same NetworkMap
+// after the tunnel interface is up.
+func (m *DefaultManager) PrepareRouteRanges(newRoutes []*route.Route) []string {
+	_, clientRoutes := m.ClassifyRoutes(newRoutes)
+
+	m.mux.Lock()
+	defer m.mux.Unlock()
+	m.clientRoutes = clientRoutes
+	if m.disableClientRoutes {
+		return nil
+	}
+
+	m.updateRouteSelectorFromManagement(clientRoutes)
+	filtered := m.routeSelector.FilterSelectedExitNodes(clientRoutes)
+	prefixes := make([]string, 0, len(filtered))
+	seen := make(map[string]struct{})
+	for _, routes := range filtered {
+		for _, r := range routes {
+			if r == nil || r.IsDynamic() {
+				continue
+			}
+			prefix := r.NetString()
+			if _, ok := seen[prefix]; ok {
+				continue
+			}
+			seen[prefix] = struct{}{}
+			prefixes = append(prefixes, prefix)
+		}
+	}
+	sort.Strings(prefixes)
+	return prefixes
 }
 
 // updateRouteSelectorFromManagement reconciles exit-node selection on every

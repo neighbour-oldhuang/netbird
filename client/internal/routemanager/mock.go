@@ -14,6 +14,7 @@ import (
 // MockManager is the mock instance of a route manager
 type MockManager struct {
 	ClassifyRoutesFunc           func(routes []*route.Route) (map[route.ID]*route.Route, route.HAMap)
+	PrepareRouteRangesFunc       func(routes []*route.Route) []string
 	UpdateRoutesFunc             func(updateSerial uint64, serverRoutes map[route.ID]*route.Route, clientRoutes route.HAMap, useNewDNSRoute bool) error
 	TriggerSelectionFunc         func(haMap route.HAMap)
 	SelectRoutesFunc             func(ids []route.NetID, appendRoute bool) error
@@ -49,6 +50,14 @@ func (m *MockManager) ClassifyRoutes(routes []*route.Route) (map[route.ID]*route
 		return m.ClassifyRoutesFunc(routes)
 	}
 	return nil, nil
+}
+
+// PrepareRouteRanges mock implementation of initial mobile route projection.
+func (m *MockManager) PrepareRouteRanges(routes []*route.Route) []string {
+	if m.PrepareRouteRangesFunc != nil {
+		return m.PrepareRouteRangesFunc(routes)
+	}
+	return nil
 }
 
 func (m *MockManager) TriggerSelection(networks route.HAMap) {

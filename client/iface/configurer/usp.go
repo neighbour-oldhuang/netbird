@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -343,7 +342,7 @@ func (t *WGUSPConfigurer) Close() {
 		}
 	}
 
-	if runtime.GOOS == "linux" {
+	if supportsLinuxConfigurerOps() {
 		sockPath := "/var/run/wireguard/" + t.deviceName + ".sock"
 		if _, statErr := os.Stat(sockPath); statErr == nil {
 			_ = os.Remove(sockPath)
@@ -501,7 +500,7 @@ func toBytes(s string) (int64, error) {
 }
 
 func getFwmark() int {
-	if nbnet.AdvancedRouting() && runtime.GOOS == "linux" {
+	if nbnet.AdvancedRouting() && supportsLinuxConfigurerOps() {
 		return int(nbnet.ControlPlaneMark)
 	}
 	return 0

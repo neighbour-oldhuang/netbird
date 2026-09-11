@@ -45,6 +45,10 @@ func WithSweeper(sweeper Sweeper) grpc.DialOption {
 }
 
 func dialContext(ctx context.Context, addr string) (net.Conn, error) {
+	if useStandardPlatformDialer {
+		dialer := &net.Dialer{}
+		return dialer.DialContext(ctx, "tcp", addr)
+	}
 	if runtime.GOOS == "linux" {
 		currentUser, err := user.Current()
 		if err != nil {

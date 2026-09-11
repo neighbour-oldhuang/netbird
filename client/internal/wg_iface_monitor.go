@@ -34,8 +34,8 @@ func NewWGIfaceMonitor() *WGIfaceMonitor {
 func (m *WGIfaceMonitor) Start(ctx context.Context, ifaceName string) (shouldRestart bool, err error) {
 	defer close(m.done)
 
-	// Skip on mobile platforms as they handle interface lifecycle differently
-	if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+	// Skip on mobile platforms as they handle interface lifecycle differently.
+	if !wgIfaceMonitorSupported() || runtime.GOOS == "android" || runtime.GOOS == "ios" {
 		log.Debugf("Interface monitor: skipped on %s platform", runtime.GOOS)
 		return false, errors.New("not supported on mobile platforms")
 	}

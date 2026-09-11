@@ -1,6 +1,7 @@
 package iface
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -56,6 +57,7 @@ type wgProxyFactory interface {
 }
 
 type WGIFaceOpts struct {
+	Context      context.Context
 	IFaceName    string
 	Address      wgaddr.Address
 	WGPort       int

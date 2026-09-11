@@ -1,4 +1,4 @@
-//go:build (linux && !android) || freebsd
+//go:build (linux && !android && !harmony) || freebsd
 
 package device
 

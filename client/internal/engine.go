@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -101,6 +102,11 @@ const (
 	// stop runs with syncMsgMux held. The sockets are closed either way, so
 	// giving up costs a query that was already failing.
 	dnsForwarderStopTimeout = 2 * time.Second
+
+	// initialNetworkMapTimeout bounds Harmony's pre-tunnel management prefetch.
+	// A complete initial map is mandatory: timing out fails closed before any
+	// platform tunnel fd can be requested or consumed.
+	initialNetworkMapTimeout = 30 * time.Second
 )
 
 var ErrResetConnection = fmt.Errorf("reset connection")
@@ -232,7 +238,8 @@ type Engine struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	started bool
+	started                 bool
+	managementStreamStarted bool
 
 	wgInterface WGIface
 
@@ -247,6 +254,16 @@ type Engine struct {
 	// updates have a base to apply changes against. nil for legacy-format
 	// peers. Guarded by syncMsgMux.
 	latestComponents *types.NetworkMapComponents
+
+	// The aggregate diagnostics are read from status callbacks that can run
+	// while handleSync holds syncMsgMux and waits on platform work. Keep them
+	// behind an independent lock to avoid a cross-runtime self-deadlock.
+	networkMapDiagnosticsMu    sync.RWMutex
+	latestSyncVersion          int32
+	latestDecodedRouteCount    int
+	latestNetworkResourceCount int
+	latestNetworkRouterCount   int
+	latestResourcePolicyCount  int
 
 	networkMonitor *networkmonitor.NetworkMonitor
 
@@ -626,6 +643,12 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 
 	e.dnsServer.SetRouteSources(e.routeManager.GetSelectedClientRoutes, e.routeManager.GetActiveClientRoutes)
 
+	if e.mobileDep.Platform == MobilePlatformHarmony && e.mobileDep.TunFDProvider != nil {
+		if err := e.prefetchInitialNetworkMap(initialNetworkMapTimeout); err != nil {
+			return fmt.Errorf("prefetch initial network map: %w", err)
+		}
+	}
+
 	if err = e.wgInterfaceCreate(); err != nil {
 		log.Errorf("failed creating tunnel interface %s: [%s]", e.config.WgIfaceName, err.Error())
 		return fmt.Errorf("create wg interface: %w", err)
@@ -708,21 +731,24 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	// starting network monitor at the very last to avoid disruptions
 	e.startNetworkMonitor()
 
-	// monitor WireGuard interface lifecycle and restart engine on changes
-	e.wgIfaceMonitor = NewWGIfaceMonitor()
-	e.shutdownWg.Add(1)
-	wgIfaceName := e.wgInterface.Name()
+	// Mobile hosts own the VPN interface lifecycle. Do not query or subscribe to
+	// the desktop OS interface table (Harmony otherwise appears as Linux).
+	if !e.mobileDep.Platform.IsMobile() {
+		e.wgIfaceMonitor = NewWGIfaceMonitor()
+		e.shutdownWg.Add(1)
+		wgIfaceName := e.wgInterface.Name()
 
-	go func() {
-		defer e.shutdownWg.Done()
+		go func() {
+			defer e.shutdownWg.Done()
 
-		if shouldRestart, err := e.wgIfaceMonitor.Start(e.ctx, wgIfaceName); shouldRestart {
-			log.Infof("WireGuard interface monitor: %s, restarting engine", err)
-			e.triggerClientRestart()
-		} else if err != nil {
-			log.Warnf("WireGuard interface monitor: %s", err)
-		}
-	}()
+			if shouldRestart, err := e.wgIfaceMonitor.Start(e.ctx, wgIfaceName); shouldRestart {
+				log.Infof("WireGuard interface monitor: %s, restarting engine", err)
+				e.triggerClientRestart()
+			} else if err != nil {
+				log.Warnf("WireGuard interface monitor: %s", err)
+			}
+		}()
+	}
 
 	return nil
 }
@@ -992,6 +1018,39 @@ func (e *Engine) phase(name string) func() {
 	}
 }
 
+// NetworkMapRuntimeSummary contains only aggregate diagnostics for the latest
+// decoded Management sync. It intentionally excludes resource, route, peer,
+// policy, and group identifiers.
+type NetworkMapRuntimeSummary struct {
+	AdvertisedSyncVersion int32
+	SyncVersion           int32
+	DecodedRoutes         int
+	NetworkResources      int
+	NetworkRouters        int
+	ResourcePolicies      int
+}
+
+// NetworkMapRuntimeSummary returns aggregate counts for status diagnostics.
+func (e *Engine) NetworkMapRuntimeSummary() NetworkMapRuntimeSummary {
+	if e == nil {
+		return NetworkMapRuntimeSummary{}
+	}
+	advertisedVersion := int32(sharedgrpc.HighestSyncMessageVersion)
+	if e.config != nil && e.config.SyncMessageVersion != nil {
+		advertisedVersion = int32(*e.config.SyncMessageVersion)
+	}
+	e.networkMapDiagnosticsMu.RLock()
+	defer e.networkMapDiagnosticsMu.RUnlock()
+	return NetworkMapRuntimeSummary{
+		AdvertisedSyncVersion: advertisedVersion,
+		SyncVersion:           e.latestSyncVersion,
+		DecodedRoutes:         e.latestDecodedRouteCount,
+		NetworkResources:      e.latestNetworkResourceCount,
+		NetworkRouters:        e.latestNetworkRouterCount,
+		ResourcePolicies:      e.latestResourcePolicyCount,
+	}
+}
+
 func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 	started := time.Now()
 	defer func() {
@@ -1025,40 +1084,31 @@ func (e *Engine) handleSync(update *mgmProto.SyncResponse) error {
 	}
 
 	// Decode the network map from either the components envelope or the
-	// legacy proto.NetworkMap before the posture-check gating below, so the
-	// "is there a network map" decision covers both wire shapes.
-	var (
-		nm         *mgmProto.NetworkMap
-		components *types.NetworkMapComponents
-	)
-	if version := update.GetVersion(); version == int32(sharedgrpc.ComponentNetworkMap) {
-		// Components-format peer: decode the envelope back to typed
-		// components, run Calculate() locally, and convert to the wire
-		// NetworkMap shape the rest of the engine consumes. Components are
-		// retained so future incremental updates can apply deltas instead
-		// of doing a full reconstruction.
-		envelope := update.GetNetworkMapEnvelope()
-		if envelope == nil {
-			return fmt.Errorf("received a SyncReponse indicating use of components network map, but components are missing")
-		}
-
-		localKey := e.config.WgPrivateKey.PublicKey().String()
-		dnsName := ""
-		if pc := update.GetPeerConfig(); pc != nil {
-			// PeerConfig.Fqdn = "<dns_label>.<dns_domain>" — extract the
-			// shared domain by stripping the peer's own label prefix. Falls
-			// back to empty if the FQDN doesn't have the expected shape.
-			dnsName = extractDNSDomainFromFQDN(pc.GetFqdn())
-		}
-		result, err := nbnetworkmap.EnvelopeToNetworkMap(e.ctx, envelope, localKey, dnsName)
-		if err != nil {
-			return fmt.Errorf("decode network map envelope: %w", err)
-		}
-		nm = result.NetworkMap
-		components = result.Components
-	} else {
-		nm = update.GetNetworkMap()
+	// legacy proto.NetworkMap before the posture-check gating below.
+	nm, components, err := e.decodeNetworkMap(update)
+	if err != nil {
+		return err
 	}
+	diagnostics := NetworkMapRuntimeSummary{SyncVersion: update.GetVersion()}
+	if nm != nil {
+		diagnostics.DecodedRoutes = len(nm.GetRoutes())
+	}
+	if components != nil {
+		diagnostics.NetworkResources = len(components.NetworkResources)
+		for _, routers := range components.RoutersMap {
+			diagnostics.NetworkRouters += len(routers)
+		}
+		for _, policies := range components.ResourcePoliciesMap {
+			diagnostics.ResourcePolicies += len(policies)
+		}
+	}
+	e.networkMapDiagnosticsMu.Lock()
+	e.latestSyncVersion = diagnostics.SyncVersion
+	e.latestDecodedRouteCount = diagnostics.DecodedRoutes
+	e.latestNetworkResourceCount = diagnostics.NetworkResources
+	e.latestNetworkRouterCount = diagnostics.NetworkRouters
+	e.latestResourcePolicyCount = diagnostics.ResourcePolicies
+	e.networkMapDiagnosticsMu.Unlock()
 
 	// Posture checks are bound to the network map presence:
 	//   NetworkMap != nil, checks present -> apply the received checks
@@ -1109,6 +1159,32 @@ func extractDNSDomainFromFQDN(fqdn string) string {
 		}
 	}
 	return ""
+}
+
+// decodeNetworkMap converts both management wire formats into the legacy
+// NetworkMap shape consumed by Engine. It is side-effect free so Harmony can
+// inspect the first map before the tunnel fd exists, then handleSync can decode
+// and apply that same response after interface startup.
+func (e *Engine) decodeNetworkMap(update *mgmProto.SyncResponse) (*mgmProto.NetworkMap, *types.NetworkMapComponents, error) {
+	if update.GetVersion() != int32(sharedgrpc.ComponentNetworkMap) {
+		return update.GetNetworkMap(), nil, nil
+	}
+
+	envelope := update.GetNetworkMapEnvelope()
+	if envelope == nil {
+		return nil, nil, fmt.Errorf("received a SyncResponse indicating use of components network map, but components are missing")
+	}
+
+	localKey := e.config.WgPrivateKey.PublicKey().String()
+	dnsName := ""
+	if pc := update.GetPeerConfig(); pc != nil {
+		dnsName = extractDNSDomainFromFQDN(pc.GetFqdn())
+	}
+	result, err := nbnetworkmap.EnvelopeToNetworkMap(e.ctx, envelope, localKey, dnsName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode network map envelope: %w", err)
+	}
+	return result.NetworkMap, result.Components, nil
 }
 
 // updateNetbirdConfig applies the management-provided NetBird configuration:
@@ -1467,9 +1543,119 @@ func validateBundleUploadURL(raw string) error {
 	return profilemanager.ValidateBundleUploadURL(raw)
 }
 
+// prefetchInitialNetworkMap starts the one management stream early and waits
+// for its first response containing a NetworkMap. Responses received before
+// that map are retained and replayed in order. The first map is projected into
+// Harmony's in-memory VPN config, then handleSync blocks on syncMsgMux until
+// Start finishes bringing the fd-backed interface up.
+func (e *Engine) prefetchInitialNetworkMap(timeout time.Duration) error {
+	result := make(chan error, 1)
+	var reportOnce sync.Once
+	report := func(err error) {
+		reportOnce.Do(func() { result <- err })
+	}
+
+	var pending []*mgmProto.SyncResponse
+	prepared := false
+	handler := func(update *mgmProto.SyncResponse) error {
+		if prepared {
+			return e.handleSync(update)
+		}
+
+		pending = append(pending, update)
+		networkMap, _, err := e.decodeNetworkMap(update)
+		if err != nil {
+			report(err)
+			return err
+		}
+		if networkMap == nil {
+			return nil
+		}
+		if err := e.prepareInitialNetworkMap(networkMap); err != nil {
+			report(err)
+			return err
+		}
+
+		prepared = true
+		report(nil)
+		for _, response := range pending {
+			if err := e.handleSync(response); err != nil {
+				return err
+			}
+		}
+		pending = nil
+		return nil
+	}
+
+	e.startManagementEvents(handler, func(err error) {
+		if prepared {
+			return
+		}
+		if err == nil {
+			err = errors.New("management stream closed before the initial NetworkMap")
+		}
+		report(err)
+	})
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		return err
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	case <-timer.C:
+		e.cancel()
+		return fmt.Errorf("initial NetworkMap timed out after %s", timeout)
+	}
+}
+
+func (e *Engine) prepareInitialNetworkMap(networkMap *mgmProto.NetworkMap) error {
+	if e.routeManager == nil || e.dnsServer == nil {
+		return errors.New("initial NetworkMap dependencies are not initialized")
+	}
+	if e.mobileDep.NetworkChangeListener == nil || e.mobileDep.DnsManager == nil {
+		return errors.New("initial NetworkMap platform callbacks are not initialized")
+	}
+
+	routeRanges := e.routeManager.PrepareRouteRanges(toRoutes(networkMap.GetRoutes()))
+	e.mobileDep.NetworkChangeListener.OnNetworkChanged(strings.Join(routeRanges, ","))
+
+	protoDNSConfig := networkMap.GetDNSConfig()
+	if protoDNSConfig == nil {
+		protoDNSConfig = &mgmProto.DNSConfig{}
+	}
+	dnsConfig := toDNSConfig(protoDNSConfig, e.config.WgAddr)
+	hostConfig := dns.HostDNSConfigFromConfig(dnsConfig, e.dnsServer.DnsIP(), dns.DefaultPort)
+	payload, err := json.Marshal(hostConfig)
+	if err != nil {
+		return fmt.Errorf("marshal initial mobile DNS config: %w", err)
+	}
+	e.mobileDep.DnsManager.ApplyDns(string(payload))
+	return nil
+}
+
 // receiveManagementEvents connects to the Management Service event stream to receive updates from the management service
 // E.g. when a new peer has been registered and we are allowed to connect to it.
 func (e *Engine) receiveManagementEvents() {
+	if e.managementStreamStarted {
+		log.Infof("Management Service updates stream already started during tunnel preparation")
+		return
+	}
+	e.startManagementEvents(e.handleSync, nil)
+}
+
+func (e *Engine) startManagementEvents(
+	handler func(*mgmProto.SyncResponse) error,
+	onExit func(error),
+) {
+	if e.managementStreamStarted {
+		if onExit != nil {
+			onExit(errors.New("management updates stream is already running"))
+		}
+		return
+	}
+	e.managementStreamStarted = true
 	e.shutdownWg.Add(1)
 	go func() {
 		defer e.shutdownWg.Done()
@@ -1481,10 +1667,13 @@ func (e *Engine) receiveManagementEvents() {
 		}
 		e.applyInfoFlags(info)
 
-		err := e.mgmClient.Sync(e.ctx, info, e.handleSync)
+		err := e.mgmClient.Sync(e.ctx, info, handler)
+		if onExit != nil {
+			onExit(err)
+		}
 		if err != nil {
-			// happens if management is unavailable for a long time.
-			// We want to cancel the operation of the whole client
+			// Happens if management is unavailable for a long time. Cancel the
+			// whole client so the normal reconnect path can rebuild all state.
 			_ = CtxGetState(e.ctx).Wrap(ErrResetConnection)
 			e.clientCancel()
 			return
@@ -2169,6 +2358,7 @@ func (e *Engine) newWgIface() (*iface.WGIface, error) {
 	}
 
 	opts := iface.WGIFaceOpts{
+		Context:      e.ctx,
 		IFaceName:    e.config.WgIfaceName,
 		Address:      e.config.WgAddr,
 		WGPort:       e.config.WgPort,
@@ -2178,35 +2368,58 @@ func (e *Engine) newWgIface() (*iface.WGIface, error) {
 		DisableDNS:   e.config.DisableDNS,
 	}
 
-	switch runtime.GOOS {
-	case "android":
-		opts.MobileArgs = &device.MobileIFaceArguments{
-			TunAdapter: e.mobileDep.TunAdapter,
-			TunFd:      int(e.mobileDep.FileDescriptor),
-		}
-	case "ios":
-		opts.MobileArgs = &device.MobileIFaceArguments{
-			TunFd: int(e.mobileDep.FileDescriptor),
-		}
-	}
+	configureMobileIFaceArgs(&opts, e.mobileDep)
 
 	return iface.NewWGIFace(opts)
 }
 
+func notifyPlatformMTU(target any, mtu uint16) bool {
+	mtuListener, ok := target.(interface{ SetMTU(int) })
+	if !ok {
+		return false
+	}
+	mtuListener.SetMTU(int(mtu))
+	return true
+}
+
+func notifyPlatformDNSAddress(target any, address string) bool {
+	dnsListener, ok := target.(interface{ SetDNSAddress(string) })
+	if !ok || strings.TrimSpace(address) == "" {
+		return false
+	}
+	dnsListener.SetDNSAddress(address)
+	return true
+}
+
 func (e *Engine) wgInterfaceCreate() (err error) {
+	switch e.mobileDep.Platform {
+	case MobilePlatformAndroid:
+		return e.wgInterface.CreateOnAndroid(e.routeManager.CurrentRouteRange(), e.dnsServer.DnsIP().String(), e.dnsServer.SearchDomains())
+	case MobilePlatformIOS, MobilePlatformHarmony:
+		if e.mobileDep.Platform == MobilePlatformHarmony {
+			notifyPlatformMTU(e.mobileDep.NetworkChangeListener, e.config.MTU)
+			if e.dnsServer != nil {
+				notifyPlatformDNSAddress(e.mobileDep.DnsManager, e.dnsServer.DnsIP().String())
+			}
+		}
+		e.mobileDep.NetworkChangeListener.SetInterfaceIP(e.config.WgAddr.String())
+		if e.config.WgAddr.HasIPv6() {
+			e.mobileDep.NetworkChangeListener.SetInterfaceIPv6(e.config.WgAddr.IPv6String())
+		}
+		return e.wgInterface.Create()
+	}
+
+	// Preserve legacy direct Engine construction on native Android/iOS builds.
 	switch runtime.GOOS {
 	case "android":
-		err = e.wgInterface.CreateOnAndroid(e.routeManager.CurrentRouteRange(), e.dnsServer.DnsIP().String(), e.dnsServer.SearchDomains())
+		return e.wgInterface.CreateOnAndroid(e.routeManager.CurrentRouteRange(), e.dnsServer.DnsIP().String(), e.dnsServer.SearchDomains())
 	case "ios":
 		e.mobileDep.NetworkChangeListener.SetInterfaceIP(e.config.WgAddr.String())
 		if e.config.WgAddr.HasIPv6() {
 			e.mobileDep.NetworkChangeListener.SetInterfaceIPv6(e.config.WgAddr.IPv6String())
 		}
-		err = e.wgInterface.Create()
-	default:
-		err = e.wgInterface.Create()
 	}
-	return err
+	return e.wgInterface.Create()
 }
 
 func (e *Engine) newDnsServer() (dns.Server, error) {
@@ -2215,6 +2428,24 @@ func (e *Engine) newDnsServer() (dns.Server, error) {
 		return e.dnsServer, nil
 	}
 
+	switch e.mobileDep.Platform {
+	case MobilePlatformAndroid:
+		dnsServer := dns.NewDefaultServerPermanentUpstream(
+			e.ctx,
+			e.wgInterface,
+			e.mobileDep.HostDNSAddresses,
+			nbdns.Config{},
+			e.mobileDep.NetworkChangeListener,
+			e.statusRecorder,
+			e.config.DisableDNS,
+		)
+		go e.mobileDep.DnsReadyListener.OnReady()
+		return dnsServer, nil
+	case MobilePlatformIOS, MobilePlatformHarmony:
+		return dns.NewDefaultServerMobile(e.ctx, e.wgInterface, e.mobileDep.DnsManager, e.statusRecorder, e.config.DisableDNS), nil
+	}
+
+	// Preserve legacy direct Engine construction on native Android/iOS builds.
 	switch runtime.GOOS {
 	case "android":
 		dnsServer := dns.NewDefaultServerPermanentUpstream(
@@ -2228,26 +2459,21 @@ func (e *Engine) newDnsServer() (dns.Server, error) {
 		)
 		go e.mobileDep.DnsReadyListener.OnReady()
 		return dnsServer, nil
-
 	case "ios":
-		dnsServer := dns.NewDefaultServerIos(e.ctx, e.wgInterface, e.mobileDep.DnsManager, e.statusRecorder, e.config.DisableDNS)
-		return dnsServer, nil
-
-	default:
-
-		dnsServer, err := dns.NewDefaultServer(e.ctx, dns.DefaultServerConfig{
-			WgInterface:    e.wgInterface,
-			CustomAddress:  e.config.CustomDNSAddress,
-			StatusRecorder: e.statusRecorder,
-			StateManager:   e.stateManager,
-			DisableSys:     e.config.DisableDNS,
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		return dnsServer, nil
+		return dns.NewDefaultServerMobile(e.ctx, e.wgInterface, e.mobileDep.DnsManager, e.statusRecorder, e.config.DisableDNS), nil
 	}
+
+	dnsServer, err := dns.NewDefaultServer(e.ctx, dns.DefaultServerConfig{
+		WgInterface:    e.wgInterface,
+		CustomAddress:  e.config.CustomDNSAddress,
+		StatusRecorder: e.statusRecorder,
+		StateManager:   e.stateManager,
+		DisableSys:     e.config.DisableDNS,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return dnsServer, nil
 }
 
 // GetRouteManager returns the route manager
@@ -2412,6 +2638,10 @@ func (e *Engine) triggerClientRestart() {
 }
 
 func (e *Engine) startNetworkMonitor() {
+	if e.mobileDep.Platform.IsMobile() {
+		log.Infof("Network monitor is managed by the %s host, not starting", e.mobileDep.Platform.OSName())
+		return
+	}
 	if !e.config.NetworkMonitor || nbnetstack.IsEnabled() {
 		log.Infof("Network monitor is disabled, not starting")
 		return

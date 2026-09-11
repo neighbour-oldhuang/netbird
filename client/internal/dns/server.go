@@ -60,10 +60,13 @@ type ReadyListener interface {
 	OnReady()
 }
 
-// IosDnsManager is a dns manager interface for iOS
-type IosDnsManager interface {
+// MobileDNSManager applies serialized DNS configuration through a mobile host app.
+type MobileDNSManager interface {
 	ApplyDns(string)
 }
+
+// IosDnsManager is kept as an alias for SDK source compatibility.
+type IosDnsManager = MobileDNSManager
 
 // Server is a dns server interface
 type Server interface {
@@ -164,9 +167,9 @@ type DefaultServer struct {
 	// instance instead of leaking its context.
 	fallbackHandler handlerWithStop
 
-	// make sense on mobile only
+	// Mobile host callbacks.
 	searchDomainNotifier *notifier
-	iosDnsManager        IosDnsManager
+	mobileDNSManager     MobileDNSManager
 
 	statusRecorder *peer.Status
 	stateManager   *statemanager.Manager
@@ -258,7 +261,22 @@ func NewDefaultServerPermanentUpstream(
 	return ds
 }
 
-// NewDefaultServerIos returns a new dns server. It optimized for ios.
+// NewDefaultServerMobile returns a DNS server whose host configuration is
+// applied by the embedding mobile application.
+func NewDefaultServerMobile(
+	ctx context.Context,
+	wgInterface WGIface,
+	dnsManager MobileDNSManager,
+	statusRecorder *peer.Status,
+	disableSys bool,
+) *DefaultServer {
+	ds := newDefaultServer(ctx, wgInterface, NewServiceViaMemory(wgInterface), statusRecorder, nil, disableSys)
+	ds.mobileDNSManager = dnsManager
+	ds.permanent = true
+	return ds
+}
+
+// NewDefaultServerIos is retained for iOS SDK source compatibility.
 func NewDefaultServerIos(
 	ctx context.Context,
 	wgInterface WGIface,
@@ -266,10 +284,7 @@ func NewDefaultServerIos(
 	statusRecorder *peer.Status,
 	disableSys bool,
 ) *DefaultServer {
-	ds := newDefaultServer(ctx, wgInterface, NewServiceViaMemory(wgInterface), statusRecorder, nil, disableSys)
-	ds.iosDnsManager = iosDnsManager
-	ds.permanent = true
-	return ds
+	return NewDefaultServerMobile(ctx, wgInterface, iosDnsManager, statusRecorder, disableSys)
 }
 
 func newDefaultServer(

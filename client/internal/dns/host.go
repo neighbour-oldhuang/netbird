@@ -86,6 +86,14 @@ func newNoopHostMocker() hostManager {
 	}
 }
 
+// HostDNSConfigFromConfig projects a management DNS config into the mobile
+// host configuration without starting or mutating the DNS server. Mobile
+// platforms use this during tunnel preparation so search domains are known
+// before the VPN interface is created.
+func HostDNSConfigFromConfig(dnsConfig nbdns.Config, ip netip.Addr, port int) HostDNSConfig {
+	return dnsConfigToHostDNSConfig(dnsConfig, ip, port)
+}
+
 func dnsConfigToHostDNSConfig(dnsConfig nbdns.Config, ip netip.Addr, port int) HostDNSConfig {
 	config := HostDNSConfig{
 		RouteAll:   false,

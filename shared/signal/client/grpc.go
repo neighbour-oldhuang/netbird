@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +40,20 @@ const (
 	// receiveWatchdogInterval is how often the watchdog evaluates the stream.
 	receiveWatchdogInterval = 10 * time.Second
 )
+
+type dialAddressContextKey struct{}
+
+// ContextWithDialAddress preserves the configured Signal target as the gRPC
+// authority and TLS server name while dialing a different socket destination.
+// The override is scoped to ctx and is never stored in the client profile.
+func ContextWithDialAddress(ctx context.Context, address string) context.Context {
+	return context.WithValue(ctx, dialAddressContextKey{}, address)
+}
+
+func dialAddressFromContext(ctx context.Context) string {
+	address, _ := ctx.Value(dialAddressContextKey{}).(string)
+	return address
+}
 
 // errReceiveStreamStalled is reported when the receive stream is transport-alive
 // but no longer delivering messages, so the stream is torn down to reconnect.
@@ -118,6 +133,12 @@ func NewClient(ctx context.Context, addr string, key wgtypes.Key, tlsEnabled boo
 	var extraOpts []grpc.DialOption
 	if c.netMgr != nil {
 		extraOpts = append(extraOpts, nbgrpc.WithSweeper(c.netMgr))
+	}
+	if dialAddress := dialAddressFromContext(ctx); dialAddress != "" {
+		dialer := &net.Dialer{}
+		extraOpts = append(extraOpts, grpc.WithContextDialer(func(dialCtx context.Context, _ string) (net.Conn, error) {
+			return dialer.DialContext(dialCtx, "tcp", dialAddress)
+		}))
 	}
 
 	var conn *grpc.ClientConn

@@ -1,4 +1,4 @@
-//go:build android || (!linux && !windows)
+//go:build android || harmony || (!linux && !windows)
 
 package firewall
 

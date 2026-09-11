@@ -67,12 +67,20 @@ func (f *fakeListener) SetInterfaceIPv6(ip string) {
 	f.rec.record("ipv6", ip)
 }
 
+func (f *fakeListener) SetMTU(mtu int) {
+	f.rec.record("mtu", fmt.Sprintf("%d", mtu))
+}
+
 type fakeDNSManager struct {
 	rec *recorder
 }
 
 func (f *fakeDNSManager) ApplyDns(config string) {
 	f.rec.record("dns", config)
+}
+
+func (f *fakeDNSManager) SetDNSAddress(address string) {
+	f.rec.record("dns-address", address)
 }
 
 func TestFIFOOrder(t *testing.T) {
@@ -82,15 +90,19 @@ func TestFIFOOrder(t *testing.T) {
 
 	n.SetInterfaceIP("10.0.0.1")
 	n.SetInterfaceIPv6("fd00::1")
+	n.SetMTU(1280)
+	n.SetDNSAddress("100.64.0.53")
 	n.ApplyDns(`{"domains":[]}`)
 	n.OnNetworkChanged("10.0.0.0/8,192.168.0.0/16")
 	n.ApplyDns(`{"domains":["example.com"]}`)
 
-	require.Eventually(t, func() bool { return rec.count() == 5 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return rec.count() == 7 }, time.Second, time.Millisecond)
 
 	expected := []call{
 		{kind: "ip", payload: "10.0.0.1"},
 		{kind: "ipv6", payload: "fd00::1"},
+		{kind: "mtu", payload: "1280"},
+		{kind: "dns-address", payload: "100.64.0.53"},
 		{kind: "dns", payload: `{"domains":[]}`},
 		{kind: "routes", payload: "10.0.0.0/8,192.168.0.0/16"},
 		{kind: "dns", payload: `{"domains":["example.com"]}`},

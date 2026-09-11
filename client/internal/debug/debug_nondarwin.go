@@ -1,4 +1,4 @@
-//go:build unix && !darwin && !android
+//go:build unix && !darwin && !android && !harmony
 
 package debug
 

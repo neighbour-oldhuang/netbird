@@ -1,4 +1,4 @@
-//go:build linux && !android
+//go:build linux && !android && !harmony
 
 // Package iface provides wireguard network interface creation and management
 package device

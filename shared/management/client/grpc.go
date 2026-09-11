@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"sync"
@@ -31,6 +32,21 @@ import (
 )
 
 const ConnectTimeout = 10 * time.Second
+
+type dialAddressContextKey struct{}
+
+// ContextWithDialAddress preserves the configured Management target as the
+// gRPC authority/TLS server name while connecting the underlying socket to a
+// different address. It is intended for platform-local transports such as a
+// USB reverse tunnel and is never persisted in the NetBird profile.
+func ContextWithDialAddress(ctx context.Context, address string) context.Context {
+	return context.WithValue(ctx, dialAddressContextKey{}, address)
+}
+
+func dialAddressFromContext(ctx context.Context) string {
+	address, _ := ctx.Value(dialAddressContextKey{}).(string)
+	return address
+}
 
 const healthCheckTimeout = 5 * time.Second
 
@@ -144,6 +160,12 @@ func NewClient(ctx context.Context, addr string, ourPrivateKey wgtypes.Key, tlsE
 	}
 	if c.netMgr != nil {
 		extraOpts = append(extraOpts, nbgrpc.WithSweeper(c.netMgr))
+	}
+	if dialAddress := dialAddressFromContext(ctx); dialAddress != "" {
+		dialer := &net.Dialer{}
+		extraOpts = append(extraOpts, grpc.WithContextDialer(func(dialCtx context.Context, _ string) (net.Conn, error) {
+			return dialer.DialContext(dialCtx, "tcp", dialAddress)
+		}))
 	}
 
 	var conn *grpc.ClientConn

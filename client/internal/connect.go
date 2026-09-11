@@ -115,13 +115,16 @@ func (c *ConnectClient) SetUpdateManager(um *updater.Manager) {
 
 // Run with main logic.
 func (c *ConnectClient) Run(runningChan chan struct{}, logPath string) error {
+	if isHarmonyBuild() {
+		return errors.New("Run is not supported on HarmonyOS; use RunOnHarmony with platform dependencies")
+	}
 	if androidRunOverride != nil {
 		return androidRunOverride(c, runningChan, logPath)
 	}
 	return c.run(MobileDependency{}, runningChan, logPath)
 }
 
-// RunOnAndroid with main logic on mobile system
+// RunOnAndroid runs the client with Android-owned platform services.
 func (c *ConnectClient) RunOnAndroid(
 	tunAdapter device.TunAdapter,
 	iFaceDiscover stdnet.ExternalIFaceDiscover,
@@ -134,8 +137,8 @@ func (c *ConnectClient) RunOnAndroid(
 	notifier := tunnelnotifier.New(networkChangeListener, nil)
 	defer notifier.Close()
 
-	// in case of non Android os these variables will be nil
 	mobileDependency := MobileDependency{
+		Platform:              MobilePlatformAndroid,
 		TunAdapter:            tunAdapter,
 		IFaceDiscover:         iFaceDiscover,
 		NetworkChangeListener: notifier,
@@ -147,6 +150,7 @@ func (c *ConnectClient) RunOnAndroid(
 	return c.run(mobileDependency, nil, "")
 }
 
+// RunOniOS runs the client with iOS-owned platform services.
 func (c *ConnectClient) RunOniOS(
 	fileDescriptor int32,
 	networkChangeListener listener.NetworkChangeListener,
@@ -162,6 +166,7 @@ func (c *ConnectClient) RunOniOS(
 	defer notifier.Close()
 
 	mobileDependency := MobileDependency{
+		Platform:              MobilePlatformIOS,
 		FileDescriptor:        fileDescriptor,
 		NetworkChangeListener: notifier,
 		DnsManager:            notifier,
@@ -169,6 +174,154 @@ func (c *ConnectClient) RunOniOS(
 		TempDir:               cacheDir,
 	}
 	return c.run(mobileDependency, nil, logFilePath)
+}
+
+// RunOnHarmony runs the client with HarmonyOS-owned VPN and platform services.
+// The host retains ownership of fileDescriptor; the Harmony interface factory
+// duplicates it before use. All paths must be app-private and writable.
+func (c *ConnectClient) RunOnHarmony(
+	fileDescriptor int32,
+	iFaceDiscover stdnet.ExternalIFaceDiscover,
+	networkChangeListener listener.NetworkChangeListener,
+	dnsManager dns.MobileDNSManager,
+	stateFilePath string,
+	cacheDir string,
+	logFilePath string,
+) error {
+	mobileDependency, err := newHarmonyMobileDependency(
+		fileDescriptor,
+		iFaceDiscover,
+		networkChangeListener,
+		dnsManager,
+		stateFilePath,
+		cacheDir,
+	)
+	if err != nil {
+		return err
+	}
+
+	notifier := tunnelnotifier.New(networkChangeListener, dnsManager)
+	defer notifier.Close()
+	mobileDependency.NetworkChangeListener = notifier
+	mobileDependency.DnsManager = notifier
+
+	return c.run(mobileDependency, nil, logFilePath)
+}
+
+// RunOnHarmonyWithFDProvider starts HarmonyOS in two phases. It performs
+// management login and engine preparation first, then blocks at the Harmony
+// TunDevice.Create boundary until the host supplies a VPN fd. The provider
+// wait is cancelled with the engine context.
+func (c *ConnectClient) RunOnHarmonyWithFDProvider(
+	tunFDProvider device.TunFDProvider,
+	iFaceDiscover stdnet.ExternalIFaceDiscover,
+	networkChangeListener listener.NetworkChangeListener,
+	dnsManager dns.MobileDNSManager,
+	stateFilePath string,
+	cacheDir string,
+	logFilePath string,
+) error {
+	mobileDependency, err := newHarmonyMobileDependencyWithFDProvider(
+		tunFDProvider,
+		iFaceDiscover,
+		networkChangeListener,
+		dnsManager,
+		stateFilePath,
+		cacheDir,
+	)
+	if err != nil {
+		return err
+	}
+
+	notifier := tunnelnotifier.New(networkChangeListener, dnsManager)
+	defer notifier.Close()
+	mobileDependency.NetworkChangeListener = notifier
+	mobileDependency.DnsManager = notifier
+
+	return c.run(mobileDependency, nil, logFilePath)
+}
+
+func newHarmonyMobileDependencyWithFDProvider(
+	tunFDProvider device.TunFDProvider,
+	iFaceDiscover stdnet.ExternalIFaceDiscover,
+	networkChangeListener listener.NetworkChangeListener,
+	dnsManager dns.MobileDNSManager,
+	stateFilePath string,
+	cacheDir string,
+) (MobileDependency, error) {
+	if tunFDProvider == nil {
+		return MobileDependency{}, errors.New("HarmonyOS tunnel fd provider is required")
+	}
+	dependency, err := newHarmonyMobileDependencyCommon(
+		iFaceDiscover,
+		networkChangeListener,
+		dnsManager,
+		stateFilePath,
+		cacheDir,
+	)
+	if err != nil {
+		return MobileDependency{}, err
+	}
+	dependency.TunFDProvider = tunFDProvider
+	return dependency, nil
+}
+
+func newHarmonyMobileDependency(
+	fileDescriptor int32,
+	iFaceDiscover stdnet.ExternalIFaceDiscover,
+	networkChangeListener listener.NetworkChangeListener,
+	dnsManager dns.MobileDNSManager,
+	stateFilePath string,
+	cacheDir string,
+) (MobileDependency, error) {
+	if fileDescriptor <= 0 {
+		return MobileDependency{}, fmt.Errorf("HarmonyOS VPN file descriptor must be greater than zero: %d", fileDescriptor)
+	}
+	dependency, err := newHarmonyMobileDependencyCommon(
+		iFaceDiscover,
+		networkChangeListener,
+		dnsManager,
+		stateFilePath,
+		cacheDir,
+	)
+	if err != nil {
+		return MobileDependency{}, err
+	}
+	dependency.FileDescriptor = fileDescriptor
+	return dependency, nil
+}
+
+func newHarmonyMobileDependencyCommon(
+	iFaceDiscover stdnet.ExternalIFaceDiscover,
+	networkChangeListener listener.NetworkChangeListener,
+	dnsManager dns.MobileDNSManager,
+	stateFilePath string,
+	cacheDir string,
+) (MobileDependency, error) {
+	if iFaceDiscover == nil {
+		return MobileDependency{}, errors.New("HarmonyOS external interface discoverer is required")
+	}
+	if networkChangeListener == nil {
+		return MobileDependency{}, errors.New("HarmonyOS network change listener is required")
+	}
+	if dnsManager == nil {
+		return MobileDependency{}, errors.New("HarmonyOS DNS manager is required")
+	}
+	if strings.TrimSpace(stateFilePath) == "" {
+		return MobileDependency{}, errors.New("HarmonyOS state file path is required")
+	}
+	if strings.TrimSpace(cacheDir) == "" {
+		return MobileDependency{}, errors.New("HarmonyOS cache directory is required")
+	}
+
+	return MobileDependency{
+		Platform:              MobilePlatformHarmony,
+		IFaceDiscover:         iFaceDiscover,
+		NetworkChangeListener: networkChangeListener,
+		DnsManager:            dnsManager,
+		StateFilePath:         stateFilePath,
+		TempDir:               cacheDir,
+	}, nil
 }
 
 func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan struct{}, logPath string) error {
@@ -200,7 +353,11 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 		}
 	}()
 
-	log.Infof("starting NetBird client version %s on %s/%s", version.NetbirdVersion(), runtime.GOOS, runtime.GOARCH)
+	platformOS := runtime.GOOS
+	if mobileOS := mobileDependency.Platform.OSName(); mobileOS != "" {
+		platformOS = mobileOS
+	}
+	log.Infof("starting NetBird client version %s on %s/%s", version.NetbirdVersion(), platformOS, runtime.GOARCH)
 
 	nbnet.Init()
 
@@ -209,7 +366,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 		agentInfo := metrics.AgentInfo{
 			DeploymentType: metrics.DeploymentTypeUnknown,
 			Version:        version.NetbirdVersion(),
-			OS:             runtime.GOOS,
+			OS:             platformOS,
 			Arch:           runtime.GOARCH,
 		}
 		c.clientMetrics = metrics.NewClientMetrics(agentInfo)
@@ -257,12 +414,13 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 	}
 
 	var path string
-	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
-		// On mobile, use the provided state file path directly
+	if mobileDependency.Platform.IsMobile() {
+		// Mobile hosts own the state path. Harmony validation makes this
+		// non-empty so it can never fall back to a desktop Linux service path.
 		if !fileExists(mobileDependency.StateFilePath) {
 			if err := createFile(mobileDependency.StateFilePath); err != nil {
 				log.Errorf("failed to create state file: %v", err)
-				// we are not exiting as we can run without the state manager
+				// We can continue without persisted state on legacy mobile callers.
 			}
 		}
 		path = mobileDependency.StateFilePath
@@ -277,9 +435,11 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 		c.updateManager.CheckUpdateSuccess(c.ctx)
 	}
 
-	inst := installer.New()
-	if err := inst.CleanUpInstallerFiles(); err != nil {
-		log.Errorf("failed to clean up temporary installer file: %v", err)
+	if !mobileDependency.Platform.IsMobile() {
+		inst := installer.New()
+		if err := inst.CleanUpInstallerFiles(); err != nil {
+			log.Errorf("failed to clean up temporary installer file: %v", err)
+		}
 	}
 
 	defer func() {
@@ -332,7 +492,7 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 		agentInfo := metrics.AgentInfo{
 			DeploymentType: deploymentType,
 			Version:        version.NetbirdVersion(),
-			OS:             runtime.GOOS,
+			OS:             platformOS,
 			Arch:           runtime.GOARCH,
 		}
 		c.clientMetrics.UpdateAgentInfo(agentInfo, myPrivateKey.PublicKey().String())
@@ -385,7 +545,8 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 			c.statusRecorder.MarkSignalDisconnected(err)
 		}()
 
-		// with the global Netbird config in hand connect (just a connection, no stream yet) Signal
+		// With the global NetBird config in hand, establish the real Signal
+		// transport before starting the Engine and Management Sync.
 		signalClient, err := connectToSignal(engineCtx, loginResp.GetNetbirdConfig(), myPrivateKey, c.netMgr)
 		if err != nil {
 			log.Error(err)
@@ -400,7 +561,6 @@ func (c *ConnectClient) run(mobileDependency MobileDependency, runningChan chan 
 
 		signalNotifier := statusRecorderToSignalConnStateNotifier(c.statusRecorder)
 		signalClient.SetConnStateListener(signalNotifier)
-
 		c.statusRecorder.MarkSignalConnected()
 
 		relayURLs, token := parseRelayInfo(loginResp)

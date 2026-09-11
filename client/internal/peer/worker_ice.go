@@ -98,6 +98,7 @@ func NewWorkerICE(ctx context.Context, log *log.Entry, config ConnConfig, conn *
 }
 
 func (w *WorkerICE) OnNewOffer(remoteOfferAnswer *OfferAnswer) {
+	icemaker.RecordOfferReceived()
 	w.log.Debugf("OnNewOffer for ICE, serial: %s", remoteOfferAnswer.SessionIDString())
 	w.muxAgent.Lock()
 	defer w.muxAgent.Unlock()
@@ -161,6 +162,7 @@ func (w *WorkerICE) OnNewOffer(remoteOfferAnswer *OfferAnswer) {
 
 // OnRemoteCandidate Handles ICE connection Candidate provided by the remote peer.
 func (w *WorkerICE) OnRemoteCandidate(candidate ice.Candidate, haRoutes route.HAMap) {
+	icemaker.RecordRemoteCandidate()
 	w.muxAgent.Lock()
 	defer w.muxAgent.Unlock()
 	w.log.Debugf("OnRemoteCandidate from peer %s -> %s", w.config.Key, candidate.String())
@@ -254,7 +256,9 @@ func (w *WorkerICE) SessionID() ICESessionID {
 // so we have to cancel it with the provided context once agent detected a broken connection
 func (w *WorkerICE) connect(ctx context.Context, dialerCancel context.CancelFunc, agent *icemaker.ThreadSafeAgent, remoteOfferAnswer *OfferAnswer) {
 	w.log.Debugf("gather candidates")
+	icemaker.RecordGatherStarted()
 	if err := agent.GatherCandidates(); err != nil {
+		icemaker.RecordGatherFailed()
 		w.log.Warnf("failed to gather candidates: %s", err)
 		w.closeAgent(agent, dialerCancel)
 		return
@@ -416,6 +420,7 @@ func (w *WorkerICE) onICECandidate(candidate ice.Candidate) {
 	if candidate == nil {
 		return
 	}
+	icemaker.RecordLocalCandidate()
 
 	// TODO: reported port is incorrect for CandidateTypeHost, makes understanding ICE use via logs confusing as port is ignored
 	w.log.Debugf("discovered local candidate %s", candidate.String())

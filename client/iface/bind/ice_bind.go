@@ -207,6 +207,10 @@ func (b *ICEBind) Send(bufs [][]byte, ep wgConn.Endpoint) error {
 }
 
 func (s *ICEBind) createReceiverFn(pc wgConn.BatchReader, conn *net.UDPConn, rxOffload bool, msgsPool *sync.Pool) wgConn.ReceiveFunc {
+	if err := bindUDPConnToDefaultNetwork(conn); err != nil {
+		log.Errorf("failed to bind WireGuard UDP socket to Harmony default network: %v", err)
+	}
+
 	s.muUDPMux.Lock()
 	defer s.muUDPMux.Unlock()
 

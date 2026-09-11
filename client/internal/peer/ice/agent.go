@@ -80,6 +80,7 @@ func NewAgent(ctx context.Context, iFaceDiscover stdnet.ExternalIFaceDiscover, c
 		return nil, fmt.Errorf("ice.NewAgent returned nil agent without error")
 	}
 
+	RecordAgentCreated()
 	return &ThreadSafeAgent{Agent: agent}, nil
 }
 

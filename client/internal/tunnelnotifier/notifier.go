@@ -15,16 +15,19 @@ const (
 	eventIfaceIP
 	eventIfaceIPv6
 	eventDNS
+	eventMTU
+	eventDNSAddress
 )
 
 var (
 	_ listener.NetworkChangeListener = (*Notifier)(nil)
-	_ dns.IosDnsManager              = (*Notifier)(nil)
+	_ dns.MobileDNSManager           = (*Notifier)(nil)
 )
 
 type event struct {
-	kind    eventKind
-	payload string
+	kind       eventKind
+	payload    string
+	intPayload int
 }
 
 type Notifier struct {
@@ -35,10 +38,10 @@ type Notifier struct {
 	done   chan struct{}
 
 	listener   listener.NetworkChangeListener
-	dnsManager dns.IosDnsManager
+	dnsManager dns.MobileDNSManager
 }
 
-func New(l listener.NetworkChangeListener, dm dns.IosDnsManager) *Notifier {
+func New(l listener.NetworkChangeListener, dm dns.MobileDNSManager) *Notifier {
 	n := &Notifier{
 		queue:      list.New(),
 		done:       make(chan struct{}),
@@ -64,6 +67,14 @@ func (n *Notifier) SetInterfaceIPv6(ip string) {
 
 func (n *Notifier) ApplyDns(config string) {
 	n.enqueue(event{kind: eventDNS, payload: config})
+}
+
+func (n *Notifier) SetMTU(mtu int) {
+	n.enqueue(event{kind: eventMTU, intPayload: mtu})
+}
+
+func (n *Notifier) SetDNSAddress(address string) {
+	n.enqueue(event{kind: eventDNSAddress, payload: address})
 }
 
 // Close stops accepting new events and blocks until the delivery loop has
@@ -118,6 +129,14 @@ func (n *Notifier) deliverLoop() {
 		case eventDNS:
 			if dm != nil {
 				dm.ApplyDns(ev.payload)
+			}
+		case eventMTU:
+			if target, ok := l.(interface{ SetMTU(int) }); ok {
+				target.SetMTU(ev.intPayload)
+			}
+		case eventDNSAddress:
+			if target, ok := dm.(interface{ SetDNSAddress(string) }); ok {
+				target.SetDNSAddress(ev.payload)
 			}
 		}
 	}
