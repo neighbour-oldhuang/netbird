@@ -210,6 +210,16 @@ func useHarmonyComponentNetworkMap(cfg *profilemanager.Config) *profilemanager.C
 }
 
 func loadHarmonyPrivateConfig(configPath string, credential *harmonyCredentialImport) (*profilemanager.Config, error) {
+	cfg, err := readOrCreateHarmonyPrivateConfig(configPath, credential)
+	if err != nil {
+		return nil, err
+	}
+	// 全局客户端设置对新建和已有 config 都生效，且随后的登录会把它们写回配置文件。
+	applyHarmonyClientSettings(cfg)
+	return cfg, nil
+}
+
+func readOrCreateHarmonyPrivateConfig(configPath string, credential *harmonyCredentialImport) (*profilemanager.Config, error) {
 	info, err := os.Lstat(configPath)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {

@@ -1621,6 +1621,14 @@ func (e *Engine) prepareInitialNetworkMap(networkMap *mgmProto.NetworkMap) error
 	routeRanges := e.routeManager.PrepareRouteRanges(toRoutes(networkMap.GetRoutes()))
 	e.mobileDep.NetworkChangeListener.OnNetworkChanged(strings.Join(routeRanges, ","))
 
+	// Prefetching the tunnel configuration must still honour a disabled DNS
+	// management: this path pushes the resolver address straight to the platform,
+	// bypassing the host manager that the disable switch normally gates, and on
+	// HarmonyOS that address becomes the system DNS.
+	if e.config.DisableDNS {
+		return nil
+	}
+
 	protoDNSConfig := networkMap.GetDNSConfig()
 	if protoDNSConfig == nil {
 		protoDNSConfig = &mgmProto.DNSConfig{}
@@ -2398,7 +2406,10 @@ func (e *Engine) wgInterfaceCreate() (err error) {
 	case MobilePlatformIOS, MobilePlatformHarmony:
 		if e.mobileDep.Platform == MobilePlatformHarmony {
 			notifyPlatformMTU(e.mobileDep.NetworkChangeListener, e.config.MTU)
-			if e.dnsServer != nil {
+			// Disabling DNS management must also keep the resolver address out of the
+			// platform tunnel configuration: on HarmonyOS that address is what ends up
+			// as the system DNS, so pushing it anyway would ignore the user's choice.
+			if e.dnsServer != nil && !e.config.DisableDNS {
 				notifyPlatformDNSAddress(e.mobileDep.DnsManager, e.dnsServer.DnsIP().String())
 			}
 		}

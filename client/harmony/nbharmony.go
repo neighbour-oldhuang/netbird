@@ -138,6 +138,7 @@ type coreView struct {
 	ResolvedDomains     []resolvedDomainView  `json:"resolvedDomains,omitempty"`
 	TunnelAddresses     []string              `json:"tunnelAddresses"`
 	DNSAddresses        []string              `json:"dnsAddresses"`
+	PreDNSAddress       string                `json:"preDnsAddress,omitempty"`
 	NetworkMap          networkMapRuntimeView `json:"networkMap"`
 	NetworkBinding      networkBindingView    `json:"networkBinding"`
 	ICEDiagnostics      iceDiagnosticsView    `json:"iceDiagnostics"`
@@ -308,6 +309,7 @@ func (c *harmonyCore) snapshotLocked() coreView {
 		ResolvedDomains: resolvedDomainDetails(c.recorder),
 		TunnelAddresses: adapterSnapshot.Addresses,
 		DNSAddresses:    adapterSnapshot.DNSAddresses,
+		PreDNSAddress:   adapterSnapshot.PreDNSAddress,
 		NetworkBinding: networkBindingView{
 			Attempts:  attempts,
 			Succeeded: succeeded,

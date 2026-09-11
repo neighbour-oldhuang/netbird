@@ -48,6 +48,7 @@ type harmonyPlatformSnapshot struct {
 	Addresses                     []string `json:"addresses"`
 	Routes                        []string `json:"routes"`
 	DNSAddresses                  []string `json:"dnsAddresses"`
+	PreDNSAddress                 string   `json:"preDnsAddress,omitempty"`
 	SearchDomains                 []string `json:"searchDomains"`
 	MTU                           int      `json:"mtu"`
 }
@@ -595,7 +596,8 @@ func (a *harmonyPlatformAdapter) beginPreparationCycle() {
 	}
 }
 
-func (a *harmonyPlatformAdapter) rollbackDesired() harmonyPlatformSnapshot {	a.mu.Lock()
+func (a *harmonyPlatformAdapter) rollbackDesired() harmonyPlatformSnapshot {
+	a.mu.Lock()
 	defer a.mu.Unlock()
 	desiredChanged := a.interfaceIPv4 != "" || a.interfaceIPv6 != "" || a.baseRouteIPv4 != "" ||
 		a.baseRouteIPv6 != "" || len(a.routes) > 0 || a.preDNSAddress != "" ||
@@ -675,10 +677,11 @@ func (a *harmonyPlatformAdapter) snapshotLocked() harmonyPlatformSnapshot {
 		ReconfigurationTargetRevision: a.reconfigurationTarget,
 		InterfacesReady:               a.interfacesReady,
 		ConfigReady:                   a.configReadyLocked(),
-		Addresses:                     addresses,
-		Routes:                        routes,
-		DNSAddresses:                  dnsAddresses,
-		SearchDomains:                 slices.Clone(a.searchDomains),
+		Addresses:                     nonNilStrings(addresses),
+		Routes:                        nonNilStrings(routes),
+		DNSAddresses:                  nonNilStrings(dnsAddresses),
+		PreDNSAddress:                 a.preDNSAddress,
+		SearchDomains:                 nonNilStrings(slices.Clone(a.searchDomains)),
 		MTU:                           a.mtu,
 	}
 }
@@ -698,6 +701,16 @@ func normalizePrefixes(values []string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// nonNilStrings keeps an empty list from serialising as JSON null: the host reads
+// these snapshots directly, and a null where a list is expected fails its whole
+// tunnel preparation (an empty DNS list after disabling DNS management, say).
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func uniqueSorted(values []string) []string {
