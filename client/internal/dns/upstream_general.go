@@ -1,10 +1,9 @@
-//go:build !android && !ios
+﻿//go:build !android && !ios
 
 package dns
 
 import (
 	"context"
-	"net/netip"
 	"runtime"
 	"time"
 
@@ -51,11 +50,4 @@ func (u *upstreamResolver) exchange(ctx context.Context, upstream string, r *dns
 		Timeout: ClientTimeout,
 	}
 	return ExchangeWithFallback(ctx, client, r, upstream)
-}
-
-func GetClientPrivate(_ privateClientIface, _ netip.Addr, dialTimeout time.Duration) (*dns.Client, error) {
-	return &dns.Client{
-		Timeout: dialTimeout,
-		Net:     "udp",
-	}, nil
 }

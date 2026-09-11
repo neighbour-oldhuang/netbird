@@ -429,7 +429,10 @@ func (m *DefaultManager) UpdateRoutes(
 
 	var merr *multierror.Error
 	if !m.disableClientRoutes {
-		if runtime.GOOS == "android" && useNewDNSRoute && m.fakeIPManager == nil {
+		// Fake IP routing keeps every domain resource inside one aggregate block, so
+		// platforms whose tunnel configuration cannot be updated in place do not have
+		// to rebuild the tunnel for each resolved address.
+		if (runtime.GOOS == "android" || isHarmonyBuild()) && useNewDNSRoute && m.fakeIPManager == nil {
 			m.enableFakeIPRoutes()
 		}
 

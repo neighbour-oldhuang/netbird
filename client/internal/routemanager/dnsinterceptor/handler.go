@@ -478,8 +478,17 @@ func (d *DnsInterceptor) removeDNATMappings(realPrefixes []netip.Prefix, logger 
 }
 
 // internalDnatFw checks if the firewall supports internal DNAT
+// internalDnatFw reports the firewall when it can translate fake IPs back to the
+// real ones. The userspace filter implements it, so every platform that runs the
+// userspace firewall can route domain resources through the fake IP block instead
+// of adding a route per resolved address. That matters on platforms whose system
+// VPN configuration cannot be updated in place: a fake IP keeps every dynamic
+// prefix inside one aggregate block, so no tunnel rebuild is needed per lookup.
 func (d *DnsInterceptor) internalDnatFw() (internalDNATer, bool) {
-	if d.firewall == nil || d.fakeIPManager == nil || runtime.GOOS != "android" {
+	if d.firewall == nil || d.fakeIPManager == nil {
+		return nil, false
+	}
+	if runtime.GOOS != "android" && !isHarmonyBuild() {
 		return nil, false
 	}
 	fw, ok := d.firewall.(internalDNATer)
