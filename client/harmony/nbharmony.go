@@ -135,6 +135,7 @@ type coreView struct {
 	SignalErrorCode     string                `json:"signalErrorCode,omitempty"`
 	Peers               peerRuntimeView       `json:"peers"`
 	AppliedRoutes       []routeDetailView     `json:"appliedRoutes"`
+	ResolvedDomains     []resolvedDomainView  `json:"resolvedDomains,omitempty"`
 	TunnelAddresses     []string              `json:"tunnelAddresses"`
 	DNSAddresses        []string              `json:"dnsAddresses"`
 	NetworkMap          networkMapRuntimeView `json:"networkMap"`
@@ -304,6 +305,7 @@ func (c *harmonyCore) snapshotLocked() coreView {
 		EngineRunning:   false,
 		Peers:           peerRuntimeSnapshot(c.recorder),
 		AppliedRoutes:   appliedRouteDetails(c.recorder, adapterSnapshot.Routes),
+		ResolvedDomains: resolvedDomainDetails(c.recorder),
 		TunnelAddresses: adapterSnapshot.Addresses,
 		DNSAddresses:    adapterSnapshot.DNSAddresses,
 		NetworkBinding: networkBindingView{

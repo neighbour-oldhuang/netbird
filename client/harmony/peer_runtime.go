@@ -34,6 +34,43 @@ type routeDetailView struct {
 	Via    string `json:"via"`
 }
 
+type resolvedDomainView struct {
+	Domain    string   `json:"domain"`
+	Parent    string   `json:"parent,omitempty"`
+	Addresses []string `json:"addresses"`
+}
+
+// resolvedDomainDetails lists the domain based network resources the client has
+// resolved so far, with the real addresses behind them. The status recorder keeps
+// the real prefixes on purpose: the fake addresses the tunnel routes are an
+// internal translation detail and mean nothing to a user.
+func resolvedDomainDetails(recorder *peer.Status) []resolvedDomainView {
+	if recorder == nil {
+		return nil
+	}
+	states := recorder.GetResolvedDomainsStates()
+	details := make([]resolvedDomainView, 0, len(states))
+	for resolved, info := range states {
+		addresses := make([]string, 0, len(info.Prefixes))
+		for _, prefix := range info.Prefixes {
+			addresses = append(addresses, prefix.Addr().String())
+		}
+		sort.Strings(addresses)
+		parent := strings.TrimSuffix(string(info.ParentDomain), ".")
+		name := strings.TrimSuffix(string(resolved), ".")
+		if parent == name {
+			parent = ""
+		}
+		details = append(details, resolvedDomainView{
+			Domain:    name,
+			Parent:    parent,
+			Addresses: addresses,
+		})
+	}
+	sort.Slice(details, func(i, j int) bool { return details[i].Domain < details[j].Domain })
+	return details
+}
+
 // appliedRouteDetails maps each route that is actually installed on the tunnel to
 // the peer that advertises it, so the UI can show the gateway instead of a bare
 // prefix. Routes without an advertising peer belong to the tunnel itself.
